@@ -1,20 +1,26 @@
 import asyncio
 import datetime as dt
+import fnmatch
 import glob
 import os
 from io import BytesIO
 from typing import List, Tuple, Optional
-import math
-import numpy as np
 
 import aiofiles
 import cv2
+import numpy as np
 import pandas as pd
+import torch
 from PIL import Image
 from dotenv import load_dotenv
 from geographiclib.geodesic import Geodesic
 from pydantic import BaseModel
 from streetview import search_panoramas
+from torchvision import ops
+from ultralytics.engine.results import Boxes
+
+# from utils.utils import get_center_hp, calculate_heading, \
+#     get_heading_diff, wrap_around_heading, PanoramaViewer, get_fov_based_on_distance, get_lower_half_hp
 
 load_dotenv()
 
@@ -234,6 +240,24 @@ async def download_images_from_df(filepath, output_dir):
     await svc.download_and_save_images(df.head(1000), output_dir)
 
 
+def select_panos(n_panos, source, destination):
+    # selects n panoramas from each location and save meta-data to a csv
+    df = pd.read_csv(source)
+    unique_indices = df['index'].unique()
+    selected_panos = []
+
+    for idx in unique_indices:
+        panos = df[df['index'] == idx]
+        if len(panos) < n_panos:
+            panos = df[df['index'] == idx]
+        else:
+            panos = panos.head(n_panos)
+        selected_panos.extend(panos.to_dict('records'))
+    df = pd.DataFrame(selected_panos)
+    df['fov'] = df['distance'].apply(get_fov_based_on_distance)
+    df.to_csv(destination, index=False)
+
+
 # fetch_metadata_for_pano('../data/resource_features_202311171040.csv', '../data/panoramas.csv')
 # df = pd.read_csv('../data/panoramas.csv')
 # df = process_pano_metadata(df)
@@ -331,7 +355,7 @@ def calculate_fov_for_bounding_box(heading_min, pitch_min, heading_max, pitch_ma
 
 
 def sgn(x):
-    return (x > 0) - (x < 0)
+    return np.sign(x)
 
 
 class PanoramaViewer:
@@ -423,8 +447,8 @@ class PanoramaViewer:
         p = np.arcsin(z / r)
 
         return {
-            'heading': h * 180.0 / PI,
-            'pitch': p * 180.0 / PI
+            'heading': h * 180.0 / np.pi,
+            'pitch': p * 180.0 / np.pi
         }
 
 
@@ -467,3 +491,296 @@ def get_center_hp(x_min, y_min, x_max, y_max, curr_heading, curr_pitch, fov):
     # print(f"Heading: {viewer.heading}, Pitch: {viewer.pitch}, FOV: {viewer.fov}")
 
     return viewer.heading, viewer.pitch, viewer.fov
+
+
+def get_lower_half_hp(x_min, y_min, x_max, y_max, curr_heading, curr_pitch, fov):
+    center_x = (x_min + x_max) / 2
+    center_y = (y_min + y_max) / 2
+
+    # Initialize the PanoramaViewer with appropriate values
+    viewer = PanoramaViewer(fov=fov, width=640, height=640, heading=curr_heading, pitch=curr_pitch)
+
+    # Map the center, start, and end coordinates to heading and pitch
+    bot_pitch = viewer.map(center_x, y_max)['pitch']
+    top_pitch = viewer.map(center_x, y_min)['pitch']
+    # start_pitch = viewer.map(x_min, y_min)['pitch']
+    # end_pitch = viewer.map(x_min, y_max)['pitch']
+    # start_heading = viewer.map(x_min, (y_min + y_max)/2)['heading']
+    # end_heading = viewer.map(x_max, (y_min + y_max)/2)['heading']
+
+    # Update the viewer's heading and pitch to the center point's heading and pitch
+    # center_heading, center_pitch = average_heading_pitch(start_heading, start_pitch, end_heading,
+    #                                                      end_pitch)
+
+    center = viewer.map(center_x, center_y)
+    # center_pitch, center_heading = center['pitch'], center['heading']
+    viewer.heading = center['heading']
+    viewer.pitch = (top_pitch + bot_pitch) / 2
+
+    # Calculate the difference in pitch between the start and end points
+    # pitch_diff = calculate_fov_for_bounding_box(heading_min, pitch_min, heading_max, pitch_max)
+
+    # Update the viewer's field of view (fov)
+    # viewer.fov = calculate_fov_for_bounding_box(start_hp['heading'], start_hp['pitch'], end_hp['heading'], end_hp['pitch'])
+    viewer.fov = abs(top_pitch - bot_pitch) * 1.
+    # print(f"Heading: {viewer.heading}, Pitch: {viewer.pitch}, FOV: {viewer.fov}")
+
+    return viewer.heading, viewer.pitch, viewer.fov
+
+
+async def process_images_with_yolo(model, csv_path, source, destination, n_images):
+    from .streetview import SVClient
+    svc = SVClient(api_key=api_key, max_concurrent_requests=50)
+    df = pd.read_csv(csv_path).head(n_images)
+    processed_dfs = []
+    idx = 0
+    prev_index = 0
+    for _row_id, row in df.iterrows():
+        df_entry = row.to_dict()
+        index = row['index']
+        pano_id = row['pano_id']
+        year = row['year']
+        distance = row['distance']
+        heading = row['heading']
+        pitch = row['pitch']
+        fov = row['fov']
+        filename = f"{index}_id_{idx}_d_{round(distance)}_{pano_id}_y_{year}.jpg"
+        if index == prev_index:
+            idx += 1
+        else:
+            idx = 0
+        prev_index = index
+        full_path = os.path.join(source, filename)
+
+        if os.path.exists(full_path):
+            """
+            when providing to for inference YOLO, it should be in BGR format;
+            see https://github.com/ultralytics/ultralytics/issues/9912
+            """
+            image_bgr = cv2.imread(full_path)
+            result = model.predict(source=image_bgr, conf=0.2, iou=0.15, verbose=False, device='cpu')
+            boxes = filter_boxes_outside_threshold2(result[0].boxes)
+            boxes = height_based_nms(boxes, 0.2)
+            # result[0].update(boxes=boxes.data)
+            box_heights = measure_heights_of_boxes(boxes.xyxy, distance, pitch, heading, fov)
+            box_heights, boxes = remove_outliers_by_height(boxes, box_heights, 4.5, 27)
+            height_errors = (box_heights - 9.47) ** 2
+            # result[0].save(filename=os.path.join('../data/cronulla_pole_detector_out', filename))
+
+            pole_coordinates = None
+
+            if len(boxes) > 0:
+                min_error_index = height_errors.argmin()
+                # for box in result[0].boxes:
+                #     x1, y1, x2, y2 = box.xyxy[0].tolist()
+                #     color = (255, 0, 0)  # blue in bgr
+                #     cv2.rectangle(image_bgr, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                # for i, box in enumerate(boxes):
+                #     x1, y1, x2, y2 = box.xyxy[0].tolist()
+                #     if i == min_error_index:
+                #         color = (0, 0, 255)  # red in bgr
+                #         cv2.rectangle(image_bgr, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                # cv2.imwrite(os.path.join('../data/bounding_box_2', filename), image_bgr)
+                pole_coordinates = boxes[min_error_index].xyxy[0].tolist()
+            if len(boxes) == 0:  # there are no poles detected
+                print(f'No poles detected in image {_row_id}_{idx}')
+                # result[0].save(filename=os.path.join('../data/cronulla_no_poles_detected', filename))
+            if pole_coordinates is not None:
+                r_head, r_pitch, r_fov = get_center_hp(*pole_coordinates, heading, pitch, fov=fov)
+                df_entry.update({'heading': r_head, 'pitch': r_pitch, 'fov': r_fov})
+                processed_dfs.append(df_entry)
+                await asyncio.create_task(svc.download_and_save_image(pano_id, r_head, r_pitch, r_fov,
+                                                                      os.path.join(destination,
+                                                                                   filename)))
+        else:
+            print(f"Image {filename} not found in {image_folder}")
+    return pd.DataFrame(processed_dfs)
+
+
+async def download_material_images(model, csv_path, image_folder):
+    from .streetview import SVClient
+    svc = SVClient(api_key=api_key, max_concurrent_requests=50)
+    df = pd.read_csv(csv_path).head(1000)
+    idx = 0
+    prev_index = 0
+    for _row_id, row in df.iterrows():
+        index = row['index']
+        pano_id = row['pano_id']
+        year = row['year']
+        distance = row['distance']
+        heading = row['heading']
+        pitch = row['pitch']
+        fov = row['fov']
+        filename = f"{index}_id_{idx}_d_{round(distance)}_{pano_id}_y_{year}"
+        if index == prev_index:
+            idx += 1
+        else:
+            idx = 0
+        prev_index = index
+        matching_files = find_files_with_partial_name(image_folder, filename)
+        matching_label = find_files_with_partial_name(image_folder + '/labels', filename)
+        full_path = matching_files[0] if len(matching_files) > 0 else None
+
+        if full_path is not None:
+            """
+            when providing to for inference YOLO, it should be in BGR format;
+            see https://github.com/ultralytics/ultralytics/issues/9912
+            """
+            boxes = load_labels_from_txt(matching_label[0])
+            boxes = height_based_nms(boxes, 0.2)
+            # boxes = boxes[boxes.cls == 6]
+            box_heights = measure_heights_of_boxes(boxes.xyxy, distance, pitch, heading, fov)
+            boxes = boxes[box_heights.argmax()]
+            pole_coordinates = None
+            if len(boxes) > 0:
+                mod_box = boxes.data.cpu()
+                mod_box[0, 1] = mod_box[0, 1] * 0.7 + mod_box[0, 3] * 0.3
+                boxes = Boxes(mod_box, (640, 640))
+                # image_bgr = cv2.imread(full_path)
+                # for box in boxes:
+                #     x1, y1, x2, y2 = box.xyxy[0].tolist()
+                #     color = (255, 0, 0)  # blue in bgr
+                #     cv2.rectangle(image_bgr, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                # cv2.imshow('image_boxes', image_bgr)
+                # cv2.waitKey(0)  # Wait for a key press
+                # cv2.destroyAllWindows()
+                pole_coordinates = boxes.xyxy[0].tolist()
+            if len(boxes) == 0:  # there are no poles detected
+                print(f'No poles detected in image {_row_id}_{idx}')
+            if pole_coordinates is not None:
+                r_head, r_pitch, r_fov = get_lower_half_hp(*pole_coordinates, heading, pitch, fov=fov)
+                await asyncio.create_task(svc.download_and_save_image(pano_id, r_head, r_pitch, r_fov, os.path.join('../data/steel-poles/downloaded', f'{filename}.jpg')))
+            else:
+                pass
+        else:
+            print(f"Image {filename} not found in {image_folder}")
+
+
+def find_files_with_partial_name(directory, partial_name):
+    matched_files = []
+    for file in os.listdir(directory):
+        if fnmatch.fnmatch(file, f'*{partial_name}*'):
+            matched_files.append(os.path.join(directory, file))
+    return matched_files
+
+
+def load_labels_from_txt(file_path):
+    boxes = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            class_id, x_center, y_center, width, height = map(float, line.strip().split())
+            # Convert from normalized coordinates to absolute coordinates
+            x_min = x_center - width / 2
+            y_min = y_center - height / 2
+            x_max = x_center + width / 2
+            y_max = y_center + height / 2
+            # Add dummy confidence and track_id
+            confidence = 1.0
+            boxes.append([x_min * 640, y_min * 640, x_max * 640, y_max * 640, confidence, class_id])
+
+    # Convert to numpy array
+    boxes_array = torch.as_tensor(boxes)
+
+    # Create Boxes object
+    boxes_obj = Boxes(boxes_array, (640, 640))
+    return boxes_obj
+
+
+def is_bbox_within_vertical_center(image_width, bbox):
+    x1, y1, x2, y2 = bbox
+    vertical_center = image_width / 2
+
+    if x1 <= vertical_center <= x2:
+        return True
+    return False
+
+
+def is_heading_within_bbox(bbox, pole_heading, camera_heading, camera_pitch):
+    pole_heading = wrap_around_heading(pole_heading)
+    x1, y1, x2, y2 = bbox
+    viewer = PanoramaViewer(fov=120, width=640, height=640, heading=camera_heading, pitch=camera_pitch)
+    start_h = wrap_around_heading(viewer.map(x1, y1)['heading'])
+    end_h = wrap_around_heading(viewer.map(x2, y2)['heading'])
+    max_heading, min_heading = max(start_h, end_h), min(start_h, end_h)
+    if min_heading <= pole_heading <= max_heading:
+        if max_heading - min_heading > 180:
+            return False
+        return True
+    return False
+
+
+def filter_boxes_outside_threshold(boxes, threshold=100):
+    left_margin = 320 - threshold
+    right_margin = 320 + threshold
+
+    mask = (((left_margin <= boxes.xyxy[:, 0]) & (boxes.xyxy[:, 0] <= right_margin)) |
+            ((left_margin <= boxes.xyxy[:, 2]) & (boxes.xyxy[:, 0] <= right_margin)))
+    filtered_boxes = boxes[mask]
+
+    return filtered_boxes
+
+
+def filter_boxes_outside_threshold2(boxes, threshold=50):
+    box_center = (boxes.xyxy[:, 0] + boxes.xyxy[:, 2]) / 2
+    left_margin = 320 - threshold
+    right_margin = 320 + threshold
+
+    mask = ((box_center <= 320) & (boxes.xyxy[:, 2] > left_margin)) | (
+        (box_center > 320) & (boxes.xyxy[:, 0] < right_margin))
+    filtered_boxes = boxes[mask]
+
+    return filtered_boxes
+
+
+def measure_heights_of_boxes(boxes, distance, camera_pitch, camera_heading, fov):
+    viewer = PanoramaViewer(fov=fov, width=640, height=640, heading=camera_heading, pitch=camera_pitch)
+
+    # Extract coordinates
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+
+    # Map coordinates to pitches
+    pitch_1 = np.array([viewer.map(x, y)['pitch'] for x, y in zip(x1, y1)]) * np.pi / 180
+    pitch_2 = np.array([viewer.map(x, y)['pitch'] for x, y in zip(x2, y2)]) * np.pi / 180
+
+    # Calculate top and bottom pitches
+    pitch_top = np.maximum(pitch_1, pitch_2)
+    pitch_bot = np.minimum(pitch_1, pitch_2)
+
+    # Calculate heights
+    heights = distance * (np.tan(pitch_top) - np.tan(pitch_bot))
+    return heights
+
+
+def remove_outliers_by_height(boxes, box_heights, min_value, max_value):
+    mask = (min_value <= box_heights) & (box_heights <= max_value)
+    return box_heights[mask], boxes[mask]
+
+
+def height_based_nms(boxes, iou_threshold):
+    if len(boxes) == 0:
+        return boxes
+
+    heights = boxes.xyxy[:, 3] - boxes.xyxy[:, 1]
+    normalized_heights = heights / heights.max()
+    return boxes[ops.nms(boxes.xyxy, normalized_heights, iou_threshold)]
+
+
+def find_poles_within_radius(dataset, pano_location, radius):
+    # Extract the latitude and longitude of the panorama location
+    pano_lat, pano_lon, pano_heading, index = pano_location
+
+    def calculate_distance_and_heading(row):
+        pole_lat, pole_lon = (row['pole_lat'], row['pole_lon'])
+        geodesic_result = Geodesic.WGS84.Inverse(pano_lat, pano_lon, pole_lat, pole_lon)
+        heading_diff = get_heading_diff(pano_heading, geodesic_result['azi1'])
+        return geodesic_result['s12'], wrap_around_heading(geodesic_result['azi1']), heading_diff
+
+    # Apply the distance calculation to each row
+    dataset[['distance', 'heading', 'heading_diff']] = dataset.apply(
+        lambda row: pd.Series(calculate_distance_and_heading(row)), axis=1)
+
+    # Filter the DataFrame to include only rows within the specified radius
+    poles_within_radius = dataset[
+        (dataset['distance'] <= radius) & (dataset['heading_diff'] <= 70) & (dataset['index'] != index)]
+
+    return poles_within_radius
