@@ -25,6 +25,8 @@ Create a `.env` file in the root directory and add your API key:
     API_KEY=your_api_key_here
     ```
 
+5. **Copy ML models to `/models` folder**
+
 ## How to Run
 ```shell
 python __main__.py
