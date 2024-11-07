@@ -320,9 +320,7 @@ def average_heading_pitch(heading_min, pitch_min, heading_max, pitch_max):
 
 
 def vector_angle(v1, v2):
-    """Calculate the angular distance between two 3D vectors in radians."""
     dot_product = np.dot(v1, v2)
-    # Ensure the value is within the valid range for acos due to numerical precision
     dot_product = np.clip(dot_product, -1.0, 1.0)
     angle = np.arccos(dot_product)
     return angle
