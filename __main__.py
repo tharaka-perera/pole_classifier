@@ -1,38 +1,27 @@
 import asyncio
-import fnmatch
-import os
 
-import numpy as np
 import pandas as pd
-import torch
-from geographiclib.geodesic import Geodesic
-from torchvision import ops
 from ultralytics import YOLO
-from ultralytics.engine.results import Boxes
 
-from utils.utils import download_images_from_df, get_heading_diff, wrap_around_heading, PanoramaViewer, \
-    sort_pano_locations, \
+from utils.utils import download_images_from_df, sort_pano_locations, \
     fetch_metadata_for_pano, process_pano_metadata, select_panos, process_images_with_yolo
 
-api_key = os.getenv("API_KEY")
-
-
 if __name__ == "__main__":
-    # # fetch meta-data from google using the location data and save to a csv file
-    # fetch_metadata_for_pano('data/resource_features_2.csv', 'data/cronulla_source_panoramas.csv')
-    #
-    # # filter too close or distance panos, too old panos and remove unnecessary columns from csv file
-    # df = pd.read_csv('data/cronulla_source_panoramas.csv')
-    # df = process_pano_metadata(df)
-    # df.to_csv('data/filtered_cronulla_panoramas.csv', index=False)
-    #
-    # # sort panoramas according to year and heading differences
-    # df = pd.read_csv('data/filtered_cronulla_panoramas.csv')
-    # df = sort_pano_locations(df)
-    # df.to_csv('data/sorted_cronulla_panoramas.csv', index=False)
-    #
-    # # select only 3 panoramas from each pole to download from the sorted list
-    # select_panos(3, 'data/sorted_cronulla_panoramas.csv', 'data/downloaded_cronulla_panoramas.csv')
+    # fetch meta-data from google using the location data and save to a csv file
+    fetch_metadata_for_pano('data/resource_features_2.csv', 'data/cronulla_source_panoramas.csv')
+
+    # filter too close or distance panos, too old panos and remove unnecessary columns from csv file
+    df = pd.read_csv('data/cronulla_source_panoramas.csv')
+    df = process_pano_metadata(df)
+    df.to_csv('data/filtered_cronulla_panoramas.csv', index=False)
+
+    # sort panoramas according to year and heading differences
+    df = pd.read_csv('data/filtered_cronulla_panoramas.csv')
+    df = sort_pano_locations(df)
+    df.to_csv('data/sorted_cronulla_panoramas.csv', index=False)
+
+    # select only 3 panoramas from each pole to download from the sorted list
+    select_panos(3, 'data/sorted_cronulla_panoramas.csv', 'data/downloaded_cronulla_panoramas.csv')
 
     with asyncio.Runner() as runner:
         # download initial images asynchronously - make sure that the output directory is created
