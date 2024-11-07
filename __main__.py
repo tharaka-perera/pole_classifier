@@ -34,5 +34,5 @@ if __name__ == "__main__":
                                      'data/zoomed_cronulla_images', 1000))
         processed_df.to_csv('data/zoomed_panoramas_cronulla.csv', index=False)
 
-    # optional step to download images for pole material identification
-    # asyncio.run(download_material_images(model, '../data/zoomed_panoramas_brighten.csv', '../data/steel-poles/source'))
+        # optional step to download images for pole material identification
+        # runner.run(download_material_images(model, 'data/zoomed_panoramas_brighten.csv', 'data/steel-poles/source'))
