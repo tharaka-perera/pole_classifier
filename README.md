@@ -25,7 +25,7 @@ Create a `.env` file in the root directory and add your API key:
     API_KEY=your_api_key_here
     ```
 
-5. **Copy ML models to `/models` folder**
+5. **Copy ML models to `/models` folder and data files to `/data` folder**
 
 ## How to Run
 ```shell
